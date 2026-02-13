@@ -37,10 +37,17 @@ class ProxyHttpClient:
         self._pools: dict[str, ProxyPool] = {}
         self._default_pool_name: str | None = None
 
+        if default_pool is not None and not isinstance(proxies, dict):
+            raise ValueError("default_pool requires proxies to be a dict")
+
         if isinstance(proxies, list):
             self._pools[_DEFAULT] = self._make_pool(proxies)
             self._default_pool_name = _DEFAULT
         elif isinstance(proxies, dict):
+            reserved = {_ALL, _DEFAULT}
+            overlap = reserved.intersection(proxies)
+            if overlap:
+                raise ValueError(f"Reserved pool name(s): {sorted(overlap)!r}")
             for name, proxy_list in proxies.items():
                 self._pools[name] = self._make_pool(proxy_list)
             if default_pool is not None:
@@ -57,24 +64,35 @@ class ProxyHttpClient:
         self._clients: dict[str | None, httpx.AsyncClient] = {}
         self._log = structlog.get_logger()
 
-    def _make_pool(self, proxies: list[str]) -> ProxyPool:
+    def _make_pool(
+        self,
+        proxies: list[str],
+        state: dict[str, object] | None = None,
+    ) -> ProxyPool:
         return ProxyPool(
             proxies=proxies,
             strategy=self._strategy,
             blacklist_threshold=self._blacklist_threshold,
             blacklist_ttl=self._blacklist_ttl,
+            state=state,
         )
 
     def _build_combined_pool(self) -> None:
         all_proxies = []
+        state = {}
         for name, pool in self._pools.items():
             if name != _ALL:
-                all_proxies.extend(pool._proxies)
+                for proxy in pool._proxies:
+                    all_proxies.append(proxy)
+                    if proxy not in state:
+                        state[proxy] = pool._state[proxy]
         if all_proxies:
-            self._pools[_ALL] = self._make_pool(all_proxies)
+            self._pools[_ALL] = self._make_pool(all_proxies, state=state)
             self._default_pool_name = _ALL
 
     def add_pool(self, name: str, proxies: list[str]) -> None:
+        if name in (_ALL, _DEFAULT):
+            raise ValueError(f"Reserved pool name: {name!r}")
         self._pools[name] = self._make_pool(proxies)
         if self._default_pool_name == _ALL or self._default_pool_name is None:
             self._build_combined_pool()
