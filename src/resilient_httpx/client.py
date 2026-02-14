@@ -191,6 +191,7 @@ class ProxyHttpClient:
         )
 
         open_stream = None
+        proxy = None
         try:
             try:
                 async for attempt in retrying:
@@ -238,8 +239,6 @@ class ProxyHttpClient:
                                     )
                             raise _RetriableStatusError(response)
 
-                        if active_pool and proxy:
-                            await active_pool.report_success(proxy)
                         open_stream = cm
             except AllProxiesExhausted:
                 self._log.error("all_proxies_exhausted")
@@ -249,7 +248,17 @@ class ProxyHttpClient:
                 self._log.error("max_retries_exceeded", last_error=str(last))
                 raise MaxRetriesExceeded(str(last)) from last
 
-            yield response
+            try:
+                yield response
+            except Exception as exc:
+                if active_pool and proxy and isinstance(exc, httpx.HTTPError):
+                    blacklisted = await active_pool.report_failure(proxy)
+                    if blacklisted:
+                        self._log.warning("proxy_blacklisted", proxy=proxy)
+                raise
+            else:
+                if active_pool and proxy:
+                    await active_pool.report_success(proxy)
         finally:
             if open_stream is not None:
                 await open_stream.__aexit__(None, None, None)
