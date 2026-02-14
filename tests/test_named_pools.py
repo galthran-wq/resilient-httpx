@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from resilient_httpx import ProxyHttpClient, RetryPolicy
+from resilient_httpx import AsyncProxyHttpClient, RetryPolicy
 
 from .test_client import URL, NO_WAIT, _response, mock_httpx
 
@@ -13,15 +13,15 @@ INTERNAL = ["http://internal1:8080", "http://internal2:8080"]
 
 async def test_named_pools_per_request():
     captured_proxies = []
-    original_get_client = ProxyHttpClient._get_client
+    original_get_client = AsyncProxyHttpClient._get_client
 
     def spy_get_client(self, proxy):
         captured_proxies.append(proxy)
         return original_get_client(self, proxy)
 
     with mock_httpx([_response(200)] * 2):
-        with patch.object(ProxyHttpClient, "_get_client", spy_get_client):
-            async with ProxyHttpClient(
+        with patch.object(AsyncProxyHttpClient, "_get_client", spy_get_client):
+            async with AsyncProxyHttpClient(
                 proxies={"external": EXTERNAL, "internal": INTERNAL},
                 retry=NO_WAIT,
             ) as client:
@@ -33,15 +33,15 @@ async def test_named_pools_per_request():
 
 async def test_named_pools_default_combined():
     captured_proxies = []
-    original_get_client = ProxyHttpClient._get_client
+    original_get_client = AsyncProxyHttpClient._get_client
 
     def spy_get_client(self, proxy):
         captured_proxies.append(proxy)
         return original_get_client(self, proxy)
 
     with mock_httpx([_response(200)] * 4):
-        with patch.object(ProxyHttpClient, "_get_client", spy_get_client):
-            async with ProxyHttpClient(
+        with patch.object(AsyncProxyHttpClient, "_get_client", spy_get_client):
+            async with AsyncProxyHttpClient(
                 proxies={"external": EXTERNAL, "internal": INTERNAL},
                 retry=NO_WAIT,
             ) as client:
@@ -52,15 +52,15 @@ async def test_named_pools_default_combined():
 
 async def test_named_pools_explicit_default():
     captured_proxies = []
-    original_get_client = ProxyHttpClient._get_client
+    original_get_client = AsyncProxyHttpClient._get_client
 
     def spy_get_client(self, proxy):
         captured_proxies.append(proxy)
         return original_get_client(self, proxy)
 
     with mock_httpx([_response(200)] * 2):
-        with patch.object(ProxyHttpClient, "_get_client", spy_get_client):
-            async with ProxyHttpClient(
+        with patch.object(AsyncProxyHttpClient, "_get_client", spy_get_client):
+            async with AsyncProxyHttpClient(
                 proxies={"external": EXTERNAL, "internal": INTERNAL},
                 default_pool="internal",
                 retry=NO_WAIT,
@@ -73,15 +73,15 @@ async def test_named_pools_explicit_default():
 async def test_add_pool():
     extra = ["http://extra1:8080"]
     captured_proxies = []
-    original_get_client = ProxyHttpClient._get_client
+    original_get_client = AsyncProxyHttpClient._get_client
 
     def spy_get_client(self, proxy):
         captured_proxies.append(proxy)
         return original_get_client(self, proxy)
 
     with mock_httpx([_response(200)]):
-        with patch.object(ProxyHttpClient, "_get_client", spy_get_client):
-            async with ProxyHttpClient(
+        with patch.object(AsyncProxyHttpClient, "_get_client", spy_get_client):
+            async with AsyncProxyHttpClient(
                 proxies={"external": EXTERNAL},
                 retry=NO_WAIT,
             ) as client:
@@ -92,7 +92,7 @@ async def test_add_pool():
 
 async def test_add_pool_updates_combined_default():
     extra = ["http://extra1:8080"]
-    client = ProxyHttpClient(
+    client = AsyncProxyHttpClient(
         proxies={"external": EXTERNAL},
         retry=NO_WAIT,
     )
@@ -103,7 +103,7 @@ async def test_add_pool_updates_combined_default():
 
 
 async def test_unknown_pool_raises():
-    async with ProxyHttpClient(
+    async with AsyncProxyHttpClient(
         proxies={"external": EXTERNAL},
         retry=NO_WAIT,
     ) as client:
@@ -113,7 +113,7 @@ async def test_unknown_pool_raises():
 
 async def test_unknown_default_pool_raises():
     with pytest.raises(ValueError, match="Unknown default pool"):
-        ProxyHttpClient(
+        AsyncProxyHttpClient(
             proxies={"external": EXTERNAL},
             default_pool="nonexistent",
         )

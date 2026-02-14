@@ -3,7 +3,7 @@
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![coverage](https://img.shields.io/badge/coverage-99%25-brightgreen)
 
-Async HTTP client with retry, backoff, and proxy rotation. Built on top of `httpx`, `tenacity`, and `structlog`.
+HTTP client with retry, backoff, and proxy rotation. Sync and async. Built on top of `httpx`, `tenacity`, and `structlog`.
 
 ## Installation
 
@@ -13,12 +13,21 @@ pip install resilient-httpx
 
 ## Usage
 
-### Basic (no proxies)
+### Sync client
 
 ```python
 from resilient_httpx import ProxyHttpClient, RetryPolicy
 
-async with ProxyHttpClient(retry=RetryPolicy(max_attempts=5), timeout=15.0) as client:
+with ProxyHttpClient(retry=RetryPolicy(max_attempts=5), timeout=15.0) as client:
+    response = client.get("https://api.example.com/data")
+```
+
+### Async client
+
+```python
+from resilient_httpx import AsyncProxyHttpClient, RetryPolicy
+
+async with AsyncProxyHttpClient(retry=RetryPolicy(max_attempts=5), timeout=15.0) as client:
     response = await client.get("https://api.example.com/data")
 ```
 
@@ -40,9 +49,21 @@ client = ProxyHttpClient(
     blacklist_ttl=300.0,
 )
 
-async with client:
-    response = await client.get("https://api.example.com/data")
+with client:
+    response = client.get("https://api.example.com/data")
     data = response.json()
+```
+
+`AsyncProxyHttpClient` accepts the same parameters:
+
+```python
+from resilient_httpx import AsyncProxyHttpClient, RetryPolicy
+
+async with AsyncProxyHttpClient(
+    proxies=["http://proxy1:8080", "http://proxy2:8080"],
+    retry=RetryPolicy(max_attempts=5, backoff="exponential"),
+) as client:
+    response = await client.get("https://api.example.com/data")
 ```
 
 ### Custom retry policy
@@ -66,9 +87,9 @@ policy = RetryPolicy(
 ```python
 from resilient_httpx import ProxyHttpClient, AllProxiesExhausted, MaxRetriesExceeded
 
-async with ProxyHttpClient(proxies=proxy_list) as client:
+with ProxyHttpClient(proxies=proxy_list) as client:
     try:
-        response = await client.get("https://api.example.com/data")
+        response = client.get("https://api.example.com/data")
     except AllProxiesExhausted:
         ...  # all proxies blacklisted
     except MaxRetriesExceeded as exc:
@@ -76,6 +97,8 @@ async with ProxyHttpClient(proxies=proxy_list) as client:
 ```
 
 ## Configuration Reference
+
+Both `ProxyHttpClient` and `AsyncProxyHttpClient` accept the same parameters:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
