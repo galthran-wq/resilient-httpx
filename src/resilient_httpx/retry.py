@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import httpx
 from tenacity import (
     AsyncRetrying,
+    Retrying,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
@@ -46,6 +47,27 @@ class RetryPolicy:
             exceptions.extend(extra_exceptions)
 
         return AsyncRetrying(
+            stop=stop_after_attempt(self.max_attempts),
+            wait=wait,
+            retry=retry_if_exception_type(tuple(exceptions)),
+        )
+
+    def build_sync_retrying(
+        self,
+        extra_exceptions: list[type[Exception]] | None = None,
+    ) -> Retrying:
+        if self.backoff == "fixed":
+            wait = wait_fixed(self.min_wait)
+        elif self.backoff == "random_jitter":
+            wait = wait_random(min=self.min_wait, max=self.max_wait)
+        else:
+            wait = wait_exponential(min=self.min_wait, max=self.max_wait)
+
+        exceptions = list(self.retry_on_exception)
+        if extra_exceptions:
+            exceptions.extend(extra_exceptions)
+
+        return Retrying(
             stop=stop_after_attempt(self.max_attempts),
             wait=wait,
             retry=retry_if_exception_type(tuple(exceptions)),
