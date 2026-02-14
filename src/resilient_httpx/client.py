@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 import httpx
 import structlog
 from tenacity import RetryError
@@ -177,6 +180,93 @@ class ProxyHttpClient:
             last = exc.last_attempt.exception()
             self._log.error("max_retries_exceeded", last_error=str(last))
             raise MaxRetriesExceeded(str(last)) from last
+
+    @asynccontextmanager
+    async def _stream(
+        self, method: str, url: str, *, pool: str | None = None, **kwargs,
+    ) -> AsyncIterator[httpx.Response]:
+        active_pool = self._resolve_pool(pool)
+        retrying = self._retry.build_retrying(
+            extra_exceptions=[_RetriableStatusError],
+        )
+
+        open_stream = None
+        proxy = None
+        try:
+            try:
+                async for attempt in retrying:
+                    with attempt:
+                        proxy = None
+                        if active_pool:
+                            proxy = await active_pool.get_proxy()
+                            if proxy is None:
+                                if self._fallback:
+                                    self._log.warning(
+                                        "all_proxies_blacklisted",
+                                        fallback="direct",
+                                    )
+                                else:
+                                    raise AllProxiesExhausted()
+
+                        self._log.debug(
+                            "stream_attempt",
+                            method=method,
+                            url=url,
+                            proxy=proxy,
+                            attempt=attempt.retry_state.attempt_number,
+                        )
+
+                        client = self._get_client(proxy)
+                        cm = client.stream(method, url, **kwargs)
+                        try:
+                            response = await cm.__aenter__()
+                        except tuple(self._retry.retry_on_exception):
+                            if active_pool and proxy:
+                                blacklisted = await active_pool.report_failure(proxy)
+                                if blacklisted:
+                                    self._log.warning(
+                                        "proxy_blacklisted", proxy=proxy
+                                    )
+                            raise
+
+                        if response.status_code in self._retry.retry_on:
+                            await cm.__aexit__(None, None, None)
+                            if active_pool and proxy:
+                                blacklisted = await active_pool.report_failure(proxy)
+                                if blacklisted:
+                                    self._log.warning(
+                                        "proxy_blacklisted", proxy=proxy
+                                    )
+                            raise _RetriableStatusError(response)
+
+                        open_stream = cm
+            except AllProxiesExhausted:
+                self._log.error("all_proxies_exhausted")
+                raise
+            except RetryError as exc:
+                last = exc.last_attempt.exception()
+                self._log.error("max_retries_exceeded", last_error=str(last))
+                raise MaxRetriesExceeded(str(last)) from last
+
+            try:
+                yield response
+            except Exception as exc:
+                if active_pool and proxy and isinstance(exc, httpx.HTTPError):
+                    blacklisted = await active_pool.report_failure(proxy)
+                    if blacklisted:
+                        self._log.warning("proxy_blacklisted", proxy=proxy)
+                raise
+            else:
+                if active_pool and proxy:
+                    await active_pool.report_success(proxy)
+        finally:
+            if open_stream is not None:
+                await open_stream.__aexit__(None, None, None)
+
+    def stream(
+        self, method: str, url: str, *, pool: str | None = None, **kwargs,
+    ) -> AsyncIterator[httpx.Response]:
+        return self._stream(method, url, pool=pool, **kwargs)
 
     async def get(self, url: str, *, pool: str | None = None, **kwargs) -> httpx.Response:
         return await self._request("GET", url, pool=pool, **kwargs)

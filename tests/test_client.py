@@ -1,5 +1,5 @@
-from contextlib import contextmanager
-from unittest.mock import AsyncMock, patch
+from contextlib import asynccontextmanager as _acm, contextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -24,6 +24,28 @@ def mock_httpx(side_effect):
     mock = AsyncMock(side_effect=side_effect)
     with (
         patch.object(httpx.AsyncClient, "request", mock),
+        patch.object(httpx.AsyncClient, "aclose", new_callable=AsyncMock),
+    ):
+        yield mock
+
+
+@_acm
+async def _as_stream(effect):
+    if isinstance(effect, BaseException):
+        raise effect
+    yield effect
+
+
+@contextmanager
+def mock_httpx_stream(side_effects):
+    effects = iter(side_effects)
+
+    def side_effect_fn(*args, **kwargs):
+        return _as_stream(next(effects))
+
+    mock = MagicMock(side_effect=side_effect_fn)
+    with (
+        patch.object(httpx.AsyncClient, "stream", mock),
         patch.object(httpx.AsyncClient, "aclose", new_callable=AsyncMock),
     ):
         yield mock
@@ -151,4 +173,66 @@ async def test_no_retry_on_non_retriable_status():
         async with ProxyHttpClient(retry=NO_WAIT) as client:
             resp = await client.get(URL)
     assert resp.status_code == 400
+    assert mock.call_count == 1
+
+
+async def test_stream_success_no_proxies():
+    with mock_httpx_stream([_response(200)]) as mock:
+        async with ProxyHttpClient(retry=NO_WAIT) as client:
+            async with client.stream("GET", URL) as resp:
+                assert resp.status_code == 200
+    assert mock.call_count == 1
+
+
+async def test_stream_success_with_proxies(proxy_list):
+    with mock_httpx_stream([_response(200)]):
+        async with ProxyHttpClient(proxies=proxy_list, retry=NO_WAIT) as client:
+            async with client.stream("GET", URL) as resp:
+                assert resp.status_code == 200
+
+
+async def test_stream_retry_on_502():
+    with mock_httpx_stream([_response(502), _response(200)]) as mock:
+        async with ProxyHttpClient(retry=NO_WAIT) as client:
+            async with client.stream("GET", URL) as resp:
+                assert resp.status_code == 200
+    assert mock.call_count == 2
+
+
+async def test_stream_retry_on_network_exception():
+    side_effects = [httpx.ConnectError("connection refused"), _response(200)]
+    with mock_httpx_stream(side_effects) as mock:
+        async with ProxyHttpClient(retry=NO_WAIT) as client:
+            async with client.stream("GET", URL) as resp:
+                assert resp.status_code == 200
+    assert mock.call_count == 2
+
+
+async def test_stream_max_retries_exceeded():
+    with mock_httpx_stream([_response(502)] * 3):
+        async with ProxyHttpClient(retry=NO_WAIT) as client:
+            with pytest.raises(MaxRetriesExceeded):
+                async with client.stream("GET", URL):
+                    pass
+
+
+async def test_stream_all_proxies_exhausted(proxy_list):
+    responses = [_response(502)] * 4
+    with mock_httpx_stream(responses):
+        policy = RetryPolicy(max_attempts=5, min_wait=0, max_wait=0)
+        async with ProxyHttpClient(
+            proxies=proxy_list,
+            retry=policy,
+            blacklist_threshold=1,
+        ) as client:
+            with pytest.raises(AllProxiesExhausted):
+                async with client.stream("GET", URL):
+                    pass
+
+
+async def test_stream_no_retry_on_non_retriable_status():
+    with mock_httpx_stream([_response(400)]) as mock:
+        async with ProxyHttpClient(retry=NO_WAIT) as client:
+            async with client.stream("GET", URL) as resp:
+                assert resp.status_code == 400
     assert mock.call_count == 1
