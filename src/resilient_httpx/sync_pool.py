@@ -20,6 +20,7 @@ class SyncProxyPool:
         blacklist_threshold: int = 3,
         blacklist_ttl: float = 300.0,
         state: dict[str, _ProxyState] | None = None,
+        lock: threading.Lock | None = None,
     ) -> None:
         self._proxies = list(proxies)
         self._strategy = strategy
@@ -28,7 +29,7 @@ class SyncProxyPool:
         existing_state = state or {}
         self._state = {p: existing_state.get(p, _ProxyState()) for p in self._proxies}
         self._index = 0
-        self._lock = threading.Lock()
+        self._lock = lock or threading.Lock()
 
     def _is_available(self, proxy: str) -> bool:
         state = self._state[proxy]

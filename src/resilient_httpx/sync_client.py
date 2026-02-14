@@ -5,6 +5,7 @@ from contextlib import contextmanager
 
 import httpx
 import structlog
+import threading
 from tenacity import RetryError
 
 from resilient_httpx.exceptions import AllProxiesExhausted, MaxRetriesExceeded
@@ -39,6 +40,7 @@ class ProxyHttpClient:
         self._blacklist_ttl = blacklist_ttl
         self._pools: dict[str, SyncProxyPool] = {}
         self._default_pool_name: str | None = None
+        self._pool_lock: threading.Lock | None = None
 
         if default_pool is not None and not isinstance(proxies, dict):
             raise ValueError("default_pool requires proxies to be a dict")
@@ -47,6 +49,8 @@ class ProxyHttpClient:
             self._pools[_DEFAULT] = self._make_pool(proxies)
             self._default_pool_name = _DEFAULT
         elif isinstance(proxies, dict):
+            if default_pool is None:
+                self._pool_lock = threading.Lock()
             reserved = {_ALL, _DEFAULT}
             overlap = reserved.intersection(proxies)
             if overlap:
@@ -65,6 +69,7 @@ class ProxyHttpClient:
         self._headers = headers or {}
         self._fallback = fallback_to_direct
         self._clients: dict[str | None, httpx.Client] = {}
+        self._client_lock = threading.Lock()
         self._log = structlog.get_logger()
 
     def _make_pool(
@@ -78,6 +83,7 @@ class ProxyHttpClient:
             blacklist_threshold=self._blacklist_threshold,
             blacklist_ttl=self._blacklist_ttl,
             state=state,
+            lock=self._pool_lock,
         )
 
     def _build_combined_pool(self) -> None:
@@ -110,13 +116,16 @@ class ProxyHttpClient:
         return None
 
     def _get_client(self, proxy: str | None) -> httpx.Client:
-        if proxy not in self._clients:
-            self._clients[proxy] = httpx.Client(
-                proxy=proxy,
-                timeout=self._timeout,
-                headers=self._headers,
-            )
-        return self._clients[proxy]
+        with self._client_lock:
+            client = self._clients.get(proxy)
+            if client is None:
+                client = httpx.Client(
+                    proxy=proxy,
+                    timeout=self._timeout,
+                    headers=self._headers,
+                )
+                self._clients[proxy] = client
+            return client
 
     def _request(
         self, method: str, url: str, *, pool: str | None = None, **kwargs,
@@ -284,9 +293,11 @@ class ProxyHttpClient:
         return self._request("DELETE", url, pool=pool, **kwargs)
 
     def close(self) -> None:
-        for client in self._clients.values():
+        with self._client_lock:
+            clients = list(self._clients.values())
+            self._clients.clear()
+        for client in clients:
             client.close()
-        self._clients.clear()
 
     def __enter__(self) -> ProxyHttpClient:
         return self
