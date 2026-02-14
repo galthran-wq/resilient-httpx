@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -65,6 +66,7 @@ class ProxyHttpClient:
         self._headers = headers or {}
         self._fallback = fallback_to_direct
         self._clients: dict[str | None, httpx.Client] = {}
+        self._clients_lock = threading.Lock()
         self._log = structlog.get_logger()
 
     def _make_pool(
@@ -110,13 +112,14 @@ class ProxyHttpClient:
         return None
 
     def _get_client(self, proxy: str | None) -> httpx.Client:
-        if proxy not in self._clients:
-            self._clients[proxy] = httpx.Client(
-                proxy=proxy,
-                timeout=self._timeout,
-                headers=self._headers,
-            )
-        return self._clients[proxy]
+        with self._clients_lock:
+            if proxy not in self._clients:
+                self._clients[proxy] = httpx.Client(
+                    proxy=proxy,
+                    timeout=self._timeout,
+                    headers=self._headers,
+                )
+            return self._clients[proxy]
 
     def _request(
         self, method: str, url: str, *, pool: str | None = None, **kwargs,
@@ -284,9 +287,10 @@ class ProxyHttpClient:
         return self._request("DELETE", url, pool=pool, **kwargs)
 
     def close(self) -> None:
-        for client in self._clients.values():
-            client.close()
-        self._clients.clear()
+        with self._clients_lock:
+            for client in self._clients.values():
+                client.close()
+            self._clients.clear()
 
     def __enter__(self) -> ProxyHttpClient:
         return self

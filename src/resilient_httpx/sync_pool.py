@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass
@@ -26,7 +26,10 @@ class SyncProxyPool:
         self._threshold = blacklist_threshold
         self._ttl = blacklist_ttl
         existing_state = state or {}
-        self._state = {p: existing_state.get(p, _ProxyState()) for p in self._proxies}
+        self._state = {
+            p: replace(existing_state[p]) if p in existing_state else _ProxyState()
+            for p in self._proxies
+        }
         self._index = 0
         self._lock = threading.Lock()
 
