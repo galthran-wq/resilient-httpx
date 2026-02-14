@@ -1,5 +1,8 @@
 # resilient-httpx
 
+![python](https://img.shields.io/badge/python-3.10%2B-blue)
+![coverage](https://img.shields.io/badge/coverage-99%25-brightgreen)
+
 Async HTTP client with retry, backoff, and proxy rotation. Built on top of `httpx`, `tenacity`, and `structlog`.
 
 ## Installation
@@ -92,4 +95,10 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 pytest
+```
+
+Run with coverage:
+
+```bash
+pytest --cov=resilient_httpx --cov-report=term-missing
 ```

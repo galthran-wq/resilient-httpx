@@ -19,12 +19,14 @@ class ProxyPool:
         strategy: str = "round-robin",
         blacklist_threshold: int = 3,
         blacklist_ttl: float = 300.0,
+        state: dict[str, _ProxyState] | None = None,
     ) -> None:
         self._proxies = list(proxies)
         self._strategy = strategy
         self._threshold = blacklist_threshold
         self._ttl = blacklist_ttl
-        self._state: dict[str, _ProxyState] = {p: _ProxyState() for p in self._proxies}
+        existing_state = state or {}
+        self._state = {p: existing_state.get(p, _ProxyState()) for p in self._proxies}
         self._index = 0
         self._lock = asyncio.Lock()
 
