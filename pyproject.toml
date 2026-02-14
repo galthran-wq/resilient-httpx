@@ -5,12 +5,34 @@ build-backend = "hatchling.build"
 [project]
 name = "resilient-httpx"
 version = "0.1.0"
+description = "Async HTTP client with retry, backoff, and proxy rotation"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
+authors = [
+    { name = "galthran-wq" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Internet :: WWW/HTTP",
+]
 dependencies = [
     "httpx>=0.28.0",
     "tenacity>=9.1.0",
     "structlog>=25.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/galthran-wq/resilient-httpx"
+Repository = "https://github.com/galthran-wq/resilient-httpx"
+Issues = "https://github.com/galthran-wq/resilient-httpx/issues"
 
 [project.optional-dependencies]
 dev = [

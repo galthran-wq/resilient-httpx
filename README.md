@@ -8,7 +8,7 @@ Async HTTP client with retry, backoff, and proxy rotation. Built on top of `http
 ## Installation
 
 ```bash
-pip install git+https://github.com/galthran-wq/resilient-httpx.git
+pip install resilient-httpx
 ```
 
 ## Usage
