@@ -81,6 +81,7 @@ class ProxyHttpClient:
         self._clients_lock = threading.Lock()
         self._log = structlog.get_logger()
         self._probed = False
+        self._probe_lock = threading.Lock()
         if probe_on_start:
             self.probe_all()
 
@@ -153,30 +154,34 @@ class ProxyHttpClient:
         }
 
     def probe_all(self) -> dict[str, list[str]]:
-        """Probe each proxy once via probe_url. Returns {pool_name: [dead_proxies]}."""
-        if self._probed:
-            return {}
-        self._probed = True
-        seen: set[str] = set()
-        dead: dict[str, list[str]] = {}
-        for name, pool in self._pools.items():
-            if name == _ALL:
-                continue
-            dead[name] = []
-            for proxy in pool._proxies:
-                if proxy in seen:
+        """Probe each proxy once via probe_url. Returns {pool_name: [dead_proxies]}.
+
+        Idempotent — concurrent callers block on a lock and only the first one runs.
+        """
+        with self._probe_lock:
+            if self._probed:
+                return {}
+            seen: set[str] = set()
+            dead: dict[str, list[str]] = {}
+            for name, pool in self._pools.items():
+                if name == _ALL:
                     continue
-                seen.add(proxy)
-                client = self._get_client(proxy)
-                try:
-                    response = client.get(self._probe_url, timeout=self._probe_timeout)
-                    if response.status_code >= 500:
-                        raise RuntimeError(f"probe got {response.status_code}")
-                except Exception as exc:
-                    pool.blacklist(proxy)
-                    dead[name].append(proxy)
-                    self._log.warning("probe_failed", proxy=proxy, error=str(exc))
-        return dead
+                dead[name] = []
+                for proxy in pool._proxies:
+                    if proxy in seen:
+                        continue
+                    seen.add(proxy)
+                    client = self._get_client(proxy)
+                    try:
+                        response = client.get(self._probe_url, timeout=self._probe_timeout)
+                        if response.status_code >= 500:
+                            raise RuntimeError(f"probe got {response.status_code}")
+                    except Exception as exc:
+                        pool.blacklist(proxy)
+                        dead[name].append(proxy)
+                        self._log.warning("probe_failed", proxy=proxy, error=str(exc))
+            self._probed = True
+            return dead
 
     def _emit_outcome(self, pool_name: str, proxy: str | None, status: str, duration: float) -> None:
         if self._on_request_outcome is None:

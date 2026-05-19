@@ -41,40 +41,54 @@ class SyncProxyPool:
         self._on_blacklist = on_blacklist
         self._on_unblacklist = on_unblacklist
 
-    def _is_available(self, proxy: str) -> bool:
+    def _take_if_available(self, proxy: str) -> tuple[bool, bool]:
+        """Mutating helper: returns (is_available, just_recovered). Must hold _lock."""
         state = self._state[proxy]
         if state.blacklisted_until is None:
-            return True
+            return True, False
         if time.monotonic() >= state.blacklisted_until:
             state.blacklisted_until = None
             state.blacklisted_at = None
             # Reset to 0 — a single transient failure on a recovered proxy
             # must not immediately re-blacklist it.
             state.fail_count = 0
-            if self._on_unblacklist is not None:
-                try:
-                    self._on_unblacklist(proxy)
-                except Exception:
-                    pass
+            return True, True
+        return False, False
+
+    def _is_in_rotation(self, proxy: str) -> bool:
+        state = self._state[proxy]
+        if state.blacklisted_until is None:
             return True
-        return False
+        return time.monotonic() >= state.blacklisted_until
 
     def get_proxy(self) -> str | None:
+        unblacklisted: list[str] = []
         with self._lock:
-            available = [p for p in self._proxies if self._is_available(p)]
+            available: list[str] = []
+            for p in self._proxies:
+                ok, recovered = self._take_if_available(p)
+                if ok:
+                    available.append(p)
+                if recovered:
+                    unblacklisted.append(p)
             if not available:
-                return None
+                chosen = None
+            elif self._strategy == "random":
+                chosen = random.choice(available)
+            else:
+                while True:
+                    proxy = self._proxies[self._index % len(self._proxies)]
+                    self._index += 1
+                    if proxy in available:
+                        chosen = proxy
+                        break
 
-            if self._strategy == "random":
-                return random.choice(available)
-
-            while True:
-                proxy = self._proxies[self._index % len(self._proxies)]
-                self._index += 1
-                if proxy in available:
-                    return proxy
+        for p in unblacklisted:
+            self._safe_cb(self._on_unblacklist, p)
+        return chosen
 
     def report_failure(self, proxy: str) -> bool:
+        blacklisted = False
         with self._lock:
             state = self._state[proxy]
             state.fail_count += 1
@@ -83,13 +97,10 @@ class SyncProxyPool:
                 now = time.monotonic()
                 state.blacklisted_at = now
                 state.blacklisted_until = now + self._ttl
-                if self._on_blacklist is not None:
-                    try:
-                        self._on_blacklist(proxy)
-                    except Exception:
-                        pass
-                return True
-            return False
+                blacklisted = True
+        if blacklisted:
+            self._safe_cb(self._on_blacklist, proxy)
+        return blacklisted
 
     def report_success(self, proxy: str) -> None:
         with self._lock:
@@ -100,20 +111,24 @@ class SyncProxyPool:
             state.total_ok += 1
 
     def blacklist(self, proxy: str) -> None:
-        """Force-blacklist a proxy (used by probe_on_start)."""
+        """Force-blacklist a proxy (used by probe_on_start). Fires on_blacklist."""
+        fired = False
         with self._lock:
             state = self._state[proxy]
-            now = time.monotonic()
-            state.fail_count = self._threshold
-            state.blacklisted_at = now
-            state.blacklisted_until = now + self._ttl
-            if self._on_blacklist is not None:
-                try:
-                    self._on_blacklist(proxy)
-                except Exception:
-                    pass
+            if state.blacklisted_until is None:
+                now = time.monotonic()
+                state.fail_count = self._threshold
+                state.blacklisted_at = now
+                state.blacklisted_until = now + self._ttl
+                fired = True
+        if fired:
+            self._safe_cb(self._on_blacklist, proxy)
 
     def snapshot(self) -> list[dict]:
+        # Read-only — no mutation, no callbacks. May briefly show a recovered
+        # proxy as still-blacklisted until the next get_proxy() actually
+        # rotates it back in; that's intentional (matches what a request
+        # would see at this instant).
         now = time.monotonic()
         out = []
         for p, s in self._state.items():
@@ -133,9 +148,18 @@ class SyncProxyPool:
             })
         return out
 
+    @staticmethod
+    def _safe_cb(cb: Callable[[str], None] | None, proxy: str) -> None:
+        if cb is None:
+            return
+        try:
+            cb(proxy)
+        except Exception:
+            pass
+
     @property
     def active_count(self) -> int:
-        return sum(1 for p in self._proxies if self._is_available(p))
+        return sum(1 for p in self._proxies if self._is_in_rotation(p))
 
     @property
     def total_count(self) -> int:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -53,6 +54,7 @@ class AsyncProxyHttpClient:
         self._pools: dict[str, ProxyPool] = {}
         self._default_pool_name: str | None = None
         self._probed = False
+        self._probe_lock = asyncio.Lock()
 
         if default_pool is not None and not isinstance(proxies, dict):
             raise ValueError("default_pool requires proxies to be a dict")
@@ -149,30 +151,34 @@ class AsyncProxyHttpClient:
         }
 
     async def probe_all(self) -> dict[str, list[str]]:
-        """Probe each proxy once via probe_url. Returns {pool_name: [dead_proxies]}."""
-        if self._probed:
-            return {}
-        self._probed = True
-        seen: set[str] = set()
-        dead: dict[str, list[str]] = {}
-        for name, pool in self._pools.items():
-            if name == _ALL:
-                continue
-            dead[name] = []
-            for proxy in pool._proxies:
-                if proxy in seen:
+        """Probe each proxy once via probe_url. Returns {pool_name: [dead_proxies]}.
+
+        Idempotent — concurrent callers block on a lock and only the first one runs.
+        """
+        async with self._probe_lock:
+            if self._probed:
+                return {}
+            seen: set[str] = set()
+            dead: dict[str, list[str]] = {}
+            for name, pool in self._pools.items():
+                if name == _ALL:
                     continue
-                seen.add(proxy)
-                client = self._get_client(proxy)
-                try:
-                    response = await client.get(self._probe_url, timeout=self._probe_timeout)
-                    if response.status_code >= 500:
-                        raise RuntimeError(f"probe got {response.status_code}")
-                except Exception as exc:
-                    pool.blacklist(proxy)
-                    dead[name].append(proxy)
-                    self._log.warning("probe_failed", proxy=proxy, error=str(exc))
-        return dead
+                dead[name] = []
+                for proxy in pool._proxies:
+                    if proxy in seen:
+                        continue
+                    seen.add(proxy)
+                    client = self._get_client(proxy)
+                    try:
+                        response = await client.get(self._probe_url, timeout=self._probe_timeout)
+                        if response.status_code >= 500:
+                            raise RuntimeError(f"probe got {response.status_code}")
+                    except Exception as exc:
+                        await pool.blacklist(proxy)
+                        dead[name].append(proxy)
+                        self._log.warning("probe_failed", proxy=proxy, error=str(exc))
+            self._probed = True
+            return dead
 
     async def _ensure_probed(self) -> None:
         if self._probe_on_start and not self._probed:

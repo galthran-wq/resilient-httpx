@@ -49,7 +49,7 @@ async def test_pool_callbacks_fire_on_blacklist_and_unblacklist():
     pool = ProxyPool(
         proxies=PROXIES,
         blacklist_threshold=2,
-        blacklist_ttl=0.05,
+        blacklist_ttl=0.1,
         on_blacklist=blacklisted.append,
         on_unblacklist=unblacklisted.append,
     )
@@ -59,7 +59,7 @@ async def test_pool_callbacks_fire_on_blacklist_and_unblacklist():
     await pool.report_failure("http://proxy1:8080")
     assert blacklisted == ["http://proxy1:8080"]
 
-    await asyncio.sleep(0.08)
+    await asyncio.sleep(0.3)
     await pool.get_proxy()
     assert unblacklisted == ["http://proxy1:8080"]
 
@@ -72,7 +72,7 @@ def test_sync_pool_callbacks_fire_on_blacklist_and_unblacklist():
     pool = SyncProxyPool(
         proxies=PROXIES,
         blacklist_threshold=2,
-        blacklist_ttl=0.05,
+        blacklist_ttl=0.1,
         on_blacklist=blacklisted.append,
         on_unblacklist=unblacklisted.append,
     )
@@ -81,7 +81,7 @@ def test_sync_pool_callbacks_fire_on_blacklist_and_unblacklist():
     pool.report_failure("http://proxy1:8080")
     assert blacklisted == ["http://proxy1:8080"]
 
-    time.sleep(0.08)
+    time.sleep(0.3)
     pool.get_proxy()
     assert unblacklisted == ["http://proxy1:8080"]
 
@@ -166,39 +166,49 @@ def test_sync_client_outcome_callback_receives_pool_and_status():
 
 async def test_one_dead_proxy_does_not_cascade_under_load():
     # Regression: with threshold=3, one dead proxy out of 30 used to cascade-block
-    # the entire pool because TTL recovery would reset fail_count to threshold-1.
+    # the entire pool because TTL recovery would reset fail_count to threshold-1
+    # → a single transient failure on the recovered proxy re-blacklisted it
+    # immediately. Healthy proxies were not directly affected here (the simulator
+    # only fails the dead one), but the BLACKLIST EVENT COUNT for the dead proxy
+    # is the leading indicator: under the bug it grows roughly once per recovery,
+    # while under the fix it grows roughly once per `threshold` failures.
     proxies = [f"http://proxy{i}:8080" for i in range(30)]
     dead = "http://proxy0:8080"
 
-    blacklists = []
+    blacklists: list[str] = []
 
-    def on_bl(proxy):
+    def on_bl(proxy: str) -> None:
         blacklists.append(proxy)
 
+    threshold = 3
     pool = ProxyPool(
         proxies=proxies,
-        blacklist_threshold=3,
+        blacklist_threshold=threshold,
         blacklist_ttl=0.05,
         on_blacklist=on_bl,
     )
 
-    # simulate 200 sequential failures on dead + sprinkled successes on others
-    for i in range(200):
+    # 600 sequential operations. The dead proxy is selected ~600/30 = 20 times.
+    # Each visit fails. With sleeps that let TTL expire, we cycle through
+    # blacklist → recovery → blacklist. Under the fix: ~ceil(20/threshold) = ~7
+    # blacklist events. Under the bug: every recovery → 1 failure → re-blacklist
+    # → ~16+ blacklist events.
+    n_iters = 600
+    for i in range(n_iters):
         chosen = await pool.get_proxy()
         assert chosen is not None
         if chosen == dead:
             await pool.report_failure(dead)
         else:
             await pool.report_success(chosen)
-        # micro-sleep to let TTL elapse occasionally
         if i % 50 == 0:
             await asyncio.sleep(0.06)
 
-    # dead proxy should not have been blacklisted more than ~ceil(200/3+1) times.
-    # before fix it would cascade because every recovery → fail_count=2 → 1 more
-    # failure re-blacklists. Loose upper bound that proves no cascade:
-    assert len(blacklists) <= 70
-    # all 29 healthy proxies must still be in rotation
+    # Tight bound: dead proxy visits / threshold + (number of TTL recoveries).
+    # Recoveries occur at most n_iters/50 = 12 times. So upper bound ~= 20/3 + 12 = ~18.
+    # Pre-fix: would be much higher because each recovery triggered a fresh blacklist.
+    assert len(blacklists) <= 12, f"too many blacklist events: {len(blacklists)}"
+    # All 29 healthy proxies stayed in rotation.
     snap = pool.snapshot()
     healthy = [row for row in snap if row["proxy"] != dead]
     assert all(row["in_rotation"] for row in healthy)
