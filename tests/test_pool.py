@@ -56,7 +56,9 @@ async def test_ttl_recovery(proxy_list):
     assert "http://proxy1:8080" in results
 
 
-async def test_lowered_priority_after_recovery(proxy_list):
+async def test_fail_count_reset_after_recovery(proxy_list):
+    # After TTL, a recovered proxy must start with fail_count=0, not threshold-1.
+    # Otherwise a single transient failure re-blacklists it immediately under load.
     pool = ProxyPool(
         proxies=proxy_list, blacklist_threshold=3, blacklist_ttl=0.1,
     )
@@ -67,7 +69,12 @@ async def test_lowered_priority_after_recovery(proxy_list):
 
     await pool.get_proxy()
     state = pool._state["http://proxy1:8080"]
-    assert state.fail_count == 2
+    assert state.fail_count == 0
+    assert state.blacklisted_until is None
+
+    # One more transient failure must NOT immediately re-blacklist.
+    assert await pool.report_failure("http://proxy1:8080") is False
+    assert state.blacklisted_until is None
 
 
 async def test_report_success_resets(pool):
