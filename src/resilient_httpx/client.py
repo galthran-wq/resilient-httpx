@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 import httpx
@@ -33,18 +34,31 @@ class AsyncProxyHttpClient:
         blacklist_ttl: float = 300.0,
         fallback_to_direct: bool = False,
         default_pool: str | None = None,
+        on_blacklist: Callable[[str, str], None] | None = None,
+        on_unblacklist: Callable[[str, str], None] | None = None,
+        on_request_outcome: Callable[[str, str | None, str, float], None] | None = None,
+        probe_on_start: bool = False,
+        probe_url: str = "http://example.com",
+        probe_timeout: float = 5.0,
     ) -> None:
         self._strategy = proxy_strategy
         self._blacklist_threshold = blacklist_threshold
         self._blacklist_ttl = blacklist_ttl
+        self._on_blacklist = on_blacklist
+        self._on_unblacklist = on_unblacklist
+        self._on_request_outcome = on_request_outcome
+        self._probe_on_start = probe_on_start
+        self._probe_url = probe_url
+        self._probe_timeout = probe_timeout
         self._pools: dict[str, ProxyPool] = {}
         self._default_pool_name: str | None = None
+        self._probed = False
 
         if default_pool is not None and not isinstance(proxies, dict):
             raise ValueError("default_pool requires proxies to be a dict")
 
         if isinstance(proxies, list):
-            self._pools[_DEFAULT] = self._make_pool(proxies)
+            self._pools[_DEFAULT] = self._make_pool(_DEFAULT, proxies)
             self._default_pool_name = _DEFAULT
         elif isinstance(proxies, dict):
             reserved = {_ALL, _DEFAULT}
@@ -52,7 +66,7 @@ class AsyncProxyHttpClient:
             if overlap:
                 raise ValueError(f"Reserved pool name(s): {sorted(overlap)!r}")
             for name, proxy_list in proxies.items():
-                self._pools[name] = self._make_pool(proxy_list)
+                self._pools[name] = self._make_pool(name, proxy_list)
             if default_pool is not None:
                 if default_pool not in self._pools:
                     raise ValueError(f"Unknown default pool: {default_pool!r}")
@@ -69,15 +83,24 @@ class AsyncProxyHttpClient:
 
     def _make_pool(
         self,
+        name: str,
         proxies: list[str],
         state: dict[str, object] | None = None,
     ) -> ProxyPool:
+        on_blacklist = None
+        on_unblacklist = None
+        if self._on_blacklist is not None:
+            on_blacklist = lambda proxy, n=name: self._on_blacklist(n, proxy)
+        if self._on_unblacklist is not None:
+            on_unblacklist = lambda proxy, n=name: self._on_unblacklist(n, proxy)
         return ProxyPool(
             proxies=proxies,
             strategy=self._strategy,
             blacklist_threshold=self._blacklist_threshold,
             blacklist_ttl=self._blacklist_ttl,
             state=state,
+            on_blacklist=on_blacklist,
+            on_unblacklist=on_unblacklist,
         )
 
     def _build_combined_pool(self) -> None:
@@ -90,13 +113,13 @@ class AsyncProxyHttpClient:
                     if proxy not in state:
                         state[proxy] = pool._state[proxy]
         if all_proxies:
-            self._pools[_ALL] = self._make_pool(all_proxies, state=state)
+            self._pools[_ALL] = self._make_pool(_ALL, all_proxies, state=state)
             self._default_pool_name = _ALL
 
     def add_pool(self, name: str, proxies: list[str]) -> None:
         if name in (_ALL, _DEFAULT):
             raise ValueError(f"Reserved pool name: {name!r}")
-        self._pools[name] = self._make_pool(proxies)
+        self._pools[name] = self._make_pool(name, proxies)
         if self._default_pool_name == _ALL or self._default_pool_name is None:
             self._build_combined_pool()
 
@@ -118,10 +141,49 @@ class AsyncProxyHttpClient:
             )
         return self._clients[proxy]
 
+    def blacklist_snapshot(self) -> dict[str, list[dict]]:
+        return {
+            name: pool.snapshot()
+            for name, pool in self._pools.items()
+            if name != _ALL
+        }
+
+    async def probe_all(self) -> dict[str, list[str]]:
+        """Probe each proxy once via probe_url. Returns {pool_name: [dead_proxies]}."""
+        if self._probed:
+            return {}
+        self._probed = True
+        seen: set[str] = set()
+        dead: dict[str, list[str]] = {}
+        for name, pool in self._pools.items():
+            if name == _ALL:
+                continue
+            dead[name] = []
+            for proxy in pool._proxies:
+                if proxy in seen:
+                    continue
+                seen.add(proxy)
+                client = self._get_client(proxy)
+                try:
+                    response = await client.get(self._probe_url, timeout=self._probe_timeout)
+                    if response.status_code >= 500:
+                        raise RuntimeError(f"probe got {response.status_code}")
+                except Exception as exc:
+                    pool.blacklist(proxy)
+                    dead[name].append(proxy)
+                    self._log.warning("probe_failed", proxy=proxy, error=str(exc))
+        return dead
+
+    async def _ensure_probed(self) -> None:
+        if self._probe_on_start and not self._probed:
+            await self.probe_all()
+
     async def _request(
         self, method: str, url: str, *, pool: str | None = None, **kwargs,
     ) -> httpx.Response:
+        await self._ensure_probed()
         active_pool = self._resolve_pool(pool)
+        pool_name = pool or self._default_pool_name or _DEFAULT
         retrying = self._retry.build_retrying(
             extra_exceptions=[_RetriableStatusError],
         )
@@ -150,9 +212,12 @@ class AsyncProxyHttpClient:
                     )
 
                     client = self._get_client(proxy)
+                    started = time.monotonic()
                     try:
                         response = await client.request(method, url, **kwargs)
                     except tuple(self._retry.retry_on_exception):
+                        duration = time.monotonic() - started
+                        self._emit_outcome(pool_name, proxy, "failed", duration)
                         if active_pool and proxy:
                             blacklisted = await active_pool.report_failure(proxy)
                             if blacklisted:
@@ -162,6 +227,8 @@ class AsyncProxyHttpClient:
                         raise
 
                     if response.status_code in self._retry.retry_on:
+                        duration = time.monotonic() - started
+                        self._emit_outcome(pool_name, proxy, "failed", duration)
                         if active_pool and proxy:
                             blacklisted = await active_pool.report_failure(proxy)
                             if blacklisted:
@@ -170,6 +237,8 @@ class AsyncProxyHttpClient:
                                 )
                         raise _RetriableStatusError(response)
 
+                    duration = time.monotonic() - started
+                    self._emit_outcome(pool_name, proxy, "success", duration)
                     if active_pool and proxy:
                         await active_pool.report_success(proxy)
                     return response
@@ -181,17 +250,28 @@ class AsyncProxyHttpClient:
             self._log.error("max_retries_exceeded", last_error=str(last))
             raise MaxRetriesExceeded(str(last)) from last
 
+    def _emit_outcome(self, pool_name: str, proxy: str | None, status: str, duration: float) -> None:
+        if self._on_request_outcome is None:
+            return
+        try:
+            self._on_request_outcome(pool_name, proxy, status, duration)
+        except Exception:
+            pass
+
     @asynccontextmanager
     async def _stream(
         self, method: str, url: str, *, pool: str | None = None, **kwargs,
     ) -> AsyncIterator[httpx.Response]:
+        await self._ensure_probed()
         active_pool = self._resolve_pool(pool)
+        pool_name = pool or self._default_pool_name or _DEFAULT
         retrying = self._retry.build_retrying(
             extra_exceptions=[_RetriableStatusError],
         )
 
         open_stream = None
         proxy = None
+        started = 0.0
         try:
             try:
                 async for attempt in retrying:
@@ -217,10 +297,13 @@ class AsyncProxyHttpClient:
                         )
 
                         client = self._get_client(proxy)
+                        started = time.monotonic()
                         cm = client.stream(method, url, **kwargs)
                         try:
                             response = await cm.__aenter__()
                         except tuple(self._retry.retry_on_exception):
+                            duration = time.monotonic() - started
+                            self._emit_outcome(pool_name, proxy, "failed", duration)
                             if active_pool and proxy:
                                 blacklisted = await active_pool.report_failure(proxy)
                                 if blacklisted:
@@ -231,6 +314,8 @@ class AsyncProxyHttpClient:
 
                         if response.status_code in self._retry.retry_on:
                             await cm.__aexit__(None, None, None)
+                            duration = time.monotonic() - started
+                            self._emit_outcome(pool_name, proxy, "failed", duration)
                             if active_pool and proxy:
                                 blacklisted = await active_pool.report_failure(proxy)
                                 if blacklisted:
@@ -251,12 +336,16 @@ class AsyncProxyHttpClient:
             try:
                 yield response
             except Exception as exc:
+                duration = time.monotonic() - started
+                self._emit_outcome(pool_name, proxy, "failed", duration)
                 if active_pool and proxy and isinstance(exc, httpx.HTTPError):
                     blacklisted = await active_pool.report_failure(proxy)
                     if blacklisted:
                         self._log.warning("proxy_blacklisted", proxy=proxy)
                 raise
             else:
+                duration = time.monotonic() - started
+                self._emit_outcome(pool_name, proxy, "success", duration)
                 if active_pool and proxy:
                     await active_pool.report_success(proxy)
         finally:
