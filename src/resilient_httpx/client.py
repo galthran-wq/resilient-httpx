@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -15,6 +16,113 @@ from resilient_httpx.retry import RetryPolicy
 
 _ALL = "_all"
 _DEFAULT = "_default"
+
+# Recent-browser TLS/JA3 fingerprints for curl_cffi. One is chosen at random per
+# request so a single fingerprint can't be pinned+blocked (Cloudflare fingerprints
+# the plain-httpx TLS handshake and 403s it; a real-browser JA3 passes). Valid
+# curl_cffi 0.16.x targets.
+IMPERSONATE_TARGETS = (
+    "chrome120",
+    "chrome123",
+    "chrome124",
+    "chrome131",
+    "safari17_0",
+    "safari17_2_1",
+    "safari18_0",
+    "edge101",
+)
+
+
+class _ImpersonateClient:
+    """An httpx.AsyncClient-compatible shim (``request`` / ``stream`` / ``aclose``)
+    backed by curl_cffi with a per-request randomised browser TLS fingerprint.
+
+    A fresh curl_cffi session per request guarantees the JA3 actually rotates
+    (a pooled connection would keep its first handshake). curl_cffi transport
+    errors are re-raised as the matching httpx exception, so the surrounding
+    pool retry/blacklist logic in AsyncProxyHttpClient is unchanged. Responses
+    are returned as real ``httpx.Response`` objects (fully read into memory), so
+    callers keep using ``.status_code`` / ``.headers`` / ``.aiter_bytes()`` /
+    ``.raise_for_status()`` exactly as with httpx.
+    """
+
+    def __init__(
+        self,
+        proxy: str | None,
+        timeout: float,
+        headers: dict[str, str] | None,
+        targets: tuple[str, ...] = IMPERSONATE_TARGETS,
+    ) -> None:
+        self._proxy = proxy
+        self._timeout = timeout
+        # Drop any caller User-Agent: curl_cffi's impersonation sets a UA that
+        # matches the fingerprint; a mismatched UA is itself a bot signal.
+        self._headers = {k: v for k, v in (headers or {}).items() if k.lower() != "user-agent"}
+        self._targets = targets
+
+    def _proxies(self) -> dict[str, str] | None:
+        if not self._proxy:
+            return None
+        return {"https": self._proxy, "http": self._proxy}
+
+    async def _do(self, method: str, url: str, kwargs: dict) -> httpx.Response:
+        from curl_cffi.requests import AsyncSession
+        from curl_cffi.requests.exceptions import RequestException
+
+        headers = dict(self._headers)
+        extra = kwargs.get("headers")
+        if extra:
+            headers.update({k: v for k, v in dict(extra).items() if k.lower() != "user-agent"})
+        target = random.choice(self._targets)
+        try:
+            async with AsyncSession() as session:
+                resp = await session.request(
+                    method,
+                    url,
+                    impersonate=target,
+                    proxies=self._proxies(),
+                    timeout=kwargs.get("timeout", self._timeout),
+                    allow_redirects=False,
+                    headers=headers or None,
+                    params=kwargs.get("params"),
+                    json=kwargs.get("json"),
+                    data=kwargs.get("data") if kwargs.get("data") is not None else kwargs.get("content"),
+                )
+        except Exception as exc:  # noqa: BLE001 -- map curl_cffi transport errors to httpx
+            # Map every curl_cffi-originated error (RequestException family AND
+            # lower-level CurlError, matched by module) onto the httpx exception
+            # the pool's retry/blacklist logic understands; re-raise anything
+            # else (e.g. a programming bug) unchanged.
+            is_curl = isinstance(exc, RequestException) or type(exc).__module__.startswith("curl_cffi")
+            if not is_curl:
+                raise
+            if "timeout" in type(exc).__name__.lower():
+                raise httpx.TimeoutException(str(exc)) from exc
+            raise httpx.ConnectError(str(exc)) from exc
+        try:
+            raw_headers = list(resp.headers.multi_items())
+        except AttributeError:
+            raw_headers = list(dict(resp.headers).items())
+        return httpx.Response(
+            status_code=resp.status_code,
+            headers=raw_headers,
+            content=resp.content,
+            request=httpx.Request(method, url),
+        )
+
+    async def request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        return await self._do(method, url, kwargs)
+
+    @asynccontextmanager
+    async def stream(self, method: str, url: str, **kwargs) -> AsyncIterator[httpx.Response]:
+        response = await self._do(method, url, kwargs)
+        try:
+            yield response
+        finally:
+            await response.aclose()
+
+    async def aclose(self) -> None:
+        return None
 
 
 class _RetriableStatusError(Exception):
@@ -41,8 +149,12 @@ class AsyncProxyHttpClient:
         probe_on_start: bool = False,
         probe_url: str = "http://example.com",
         probe_timeout: float = 5.0,
+        impersonate: bool = False,
+        impersonate_targets: tuple[str, ...] = IMPERSONATE_TARGETS,
     ) -> None:
         self._strategy = proxy_strategy
+        self._impersonate = impersonate
+        self._impersonate_targets = impersonate_targets
         self._blacklist_threshold = blacklist_threshold
         self._blacklist_ttl = blacklist_ttl
         self._on_blacklist = on_blacklist
@@ -80,7 +192,7 @@ class AsyncProxyHttpClient:
         self._timeout = timeout
         self._headers = headers or {}
         self._fallback = fallback_to_direct
-        self._clients: dict[str | None, httpx.AsyncClient] = {}
+        self._clients: dict[tuple[str | None, bool], httpx.AsyncClient | _ImpersonateClient] = {}
         self._log = structlog.get_logger()
 
     def _make_pool(
@@ -134,14 +246,25 @@ class AsyncProxyHttpClient:
             return self._pools[self._default_pool_name]
         return None
 
-    def _get_client(self, proxy: str | None) -> httpx.AsyncClient:
-        if proxy not in self._clients:
-            self._clients[proxy] = httpx.AsyncClient(
-                proxy=proxy,
-                timeout=self._timeout,
-                headers=self._headers,
-            )
-        return self._clients[proxy]
+    def _get_client(
+        self, proxy: str | None, impersonate: bool = False
+    ) -> httpx.AsyncClient | _ImpersonateClient:
+        key = (proxy, impersonate)
+        if key not in self._clients:
+            if impersonate:
+                self._clients[key] = _ImpersonateClient(
+                    proxy=proxy,
+                    timeout=self._timeout,
+                    headers=self._headers,
+                    targets=self._impersonate_targets,
+                )
+            else:
+                self._clients[key] = httpx.AsyncClient(
+                    proxy=proxy,
+                    timeout=self._timeout,
+                    headers=self._headers,
+                )
+        return self._clients[key]
 
     def blacklist_snapshot(self) -> dict[str, list[dict]]:
         return {
@@ -185,9 +308,10 @@ class AsyncProxyHttpClient:
             await self.probe_all()
 
     async def _request(
-        self, method: str, url: str, *, pool: str | None = None, **kwargs,
+        self, method: str, url: str, *, pool: str | None = None, impersonate: bool | None = None, **kwargs,
     ) -> httpx.Response:
         await self._ensure_probed()
+        imp = self._impersonate if impersonate is None else impersonate
         active_pool = self._resolve_pool(pool)
         pool_name = pool or self._default_pool_name or _DEFAULT
         retrying = self._retry.build_retrying(
@@ -217,7 +341,7 @@ class AsyncProxyHttpClient:
                         attempt=attempt.retry_state.attempt_number,
                     )
 
-                    client = self._get_client(proxy)
+                    client = self._get_client(proxy, imp)
                     started = time.monotonic()
                     try:
                         response = await client.request(method, url, **kwargs)
@@ -266,9 +390,10 @@ class AsyncProxyHttpClient:
 
     @asynccontextmanager
     async def _stream(
-        self, method: str, url: str, *, pool: str | None = None, **kwargs,
+        self, method: str, url: str, *, pool: str | None = None, impersonate: bool | None = None, **kwargs,
     ) -> AsyncIterator[httpx.Response]:
         await self._ensure_probed()
+        imp = self._impersonate if impersonate is None else impersonate
         active_pool = self._resolve_pool(pool)
         pool_name = pool or self._default_pool_name or _DEFAULT
         retrying = self._retry.build_retrying(
@@ -302,7 +427,7 @@ class AsyncProxyHttpClient:
                             attempt=attempt.retry_state.attempt_number,
                         )
 
-                        client = self._get_client(proxy)
+                        client = self._get_client(proxy, imp)
                         started = time.monotonic()
                         cm = client.stream(method, url, **kwargs)
                         try:

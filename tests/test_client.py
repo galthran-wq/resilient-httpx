@@ -139,9 +139,9 @@ async def test_proxy_rotation_on_failure(proxy_list):
     captured_proxies = []
     original_get_client = AsyncProxyHttpClient._get_client
 
-    def spy_get_client(self, proxy):
+    def spy_get_client(self, proxy, impersonate=False):
         captured_proxies.append(proxy)
-        return original_get_client(self, proxy)
+        return original_get_client(self, proxy, impersonate)
 
     with mock_httpx([_response(502), _response(502), _response(200)]):
         with patch.object(AsyncProxyHttpClient, "_get_client", spy_get_client):

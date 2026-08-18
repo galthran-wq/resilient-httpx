@@ -15,9 +15,9 @@ async def test_named_pools_per_request():
     captured_proxies = []
     original_get_client = AsyncProxyHttpClient._get_client
 
-    def spy_get_client(self, proxy):
+    def spy_get_client(self, proxy, impersonate=False):
         captured_proxies.append(proxy)
-        return original_get_client(self, proxy)
+        return original_get_client(self, proxy, impersonate)
 
     with mock_httpx([_response(200)] * 2):
         with patch.object(AsyncProxyHttpClient, "_get_client", spy_get_client):
@@ -35,9 +35,9 @@ async def test_named_pools_default_combined():
     captured_proxies = []
     original_get_client = AsyncProxyHttpClient._get_client
 
-    def spy_get_client(self, proxy):
+    def spy_get_client(self, proxy, impersonate=False):
         captured_proxies.append(proxy)
-        return original_get_client(self, proxy)
+        return original_get_client(self, proxy, impersonate)
 
     with mock_httpx([_response(200)] * 4):
         with patch.object(AsyncProxyHttpClient, "_get_client", spy_get_client):
@@ -54,9 +54,9 @@ async def test_named_pools_explicit_default():
     captured_proxies = []
     original_get_client = AsyncProxyHttpClient._get_client
 
-    def spy_get_client(self, proxy):
+    def spy_get_client(self, proxy, impersonate=False):
         captured_proxies.append(proxy)
-        return original_get_client(self, proxy)
+        return original_get_client(self, proxy, impersonate)
 
     with mock_httpx([_response(200)] * 2):
         with patch.object(AsyncProxyHttpClient, "_get_client", spy_get_client):
@@ -75,9 +75,9 @@ async def test_add_pool():
     captured_proxies = []
     original_get_client = AsyncProxyHttpClient._get_client
 
-    def spy_get_client(self, proxy):
+    def spy_get_client(self, proxy, impersonate=False):
         captured_proxies.append(proxy)
-        return original_get_client(self, proxy)
+        return original_get_client(self, proxy, impersonate)
 
     with mock_httpx([_response(200)]):
         with patch.object(AsyncProxyHttpClient, "_get_client", spy_get_client):
