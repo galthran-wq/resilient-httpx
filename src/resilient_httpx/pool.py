@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 
 @dataclass
-class _ProxyState:
+class _HealthState:
     fail_count: int = 0
     blacklisted_until: float | None = None
     blacklisted_at: float | None = None
@@ -16,23 +16,37 @@ class _ProxyState:
     total_fail: int = 0
 
 
-class ProxyPool:
+# Backwards-compat alias (was the only state class when this pool was proxy-only).
+_ProxyState = _HealthState
+
+
+class HealthPool:
+    """A rotating pool of string identifiers (proxies OR impersonate targets, etc.)
+    with per-item health: consecutive-failure blacklisting + TTL recovery.
+
+    Originally proxy-specific (hence ``get_proxy`` / the ``proxy`` naming kept for
+    backwards compat); now generic — the async client reuses it to pick browser
+    TLS fingerprints and demote the ones a WAF has flagged, exactly like proxies.
+    """
+
     def __init__(
         self,
         proxies: list[str],
         strategy: str = "round-robin",
         blacklist_threshold: int = 3,
         blacklist_ttl: float = 300.0,
-        state: dict[str, _ProxyState] | None = None,
+        state: dict[str, _HealthState] | None = None,
         on_blacklist: Callable[[str], None] | None = None,
         on_unblacklist: Callable[[str], None] | None = None,
+        greedy_exploration: float = 0.1,
     ) -> None:
         self._proxies = list(proxies)
         self._strategy = strategy
+        self._eps = greedy_exploration
         self._threshold = blacklist_threshold
         self._ttl = blacklist_ttl
         existing_state = state or {}
-        self._state = {p: existing_state.get(p, _ProxyState()) for p in self._proxies}
+        self._state = {p: existing_state.get(p, _HealthState()) for p in self._proxies}
         self._index = 0
         self._lock = asyncio.Lock()
         self._on_blacklist = on_blacklist
@@ -72,6 +86,8 @@ class ProxyPool:
                 chosen = None
             elif self._strategy == "random":
                 chosen = random.choice(available)
+            elif self._strategy == "greedy":
+                chosen = self._greedy_pick(available)
             else:
                 while True:
                     proxy = self._proxies[self._index % len(self._proxies)]
@@ -83,6 +99,27 @@ class ProxyPool:
         for p in unblacklisted:
             self._safe_cb(self._on_unblacklist, p)
         return chosen
+
+    def _greedy_pick(self, available: list[str]) -> str:
+        """Caller holds _lock. Prefer unprobed items (cold start), else ε-explore,
+        else the highest cumulative success-rate item — so an intermittently-bad
+        fingerprint (e.g. 60% ok) is deprioritised in favour of a clean one, not
+        merely avoided once fully dead (which consecutive-fail blacklisting alone
+        never achieves for interleaved success/failure)."""
+        unprobed = [p for p in available if (self._state[p].total_ok + self._state[p].total_fail) == 0]
+        if unprobed:
+            return random.choice(unprobed)
+        if self._eps > 0 and random.random() < self._eps:
+            return random.choice(available)
+
+        def rate(p: str) -> float:
+            s = self._state[p]
+            return s.total_ok / (s.total_ok + s.total_fail)
+
+        return max(available, key=rate)
+
+    # Generic alias for non-proxy callers (e.g. the impersonate-target pool).
+    acquire = get_proxy
 
     async def report_failure(self, proxy: str) -> bool:
         blacklisted = False
@@ -161,3 +198,7 @@ class ProxyPool:
     @property
     def total_count(self) -> int:
         return len(self._proxies)
+
+
+# Backwards-compat alias: this class used to be proxy-only.
+ProxyPool = HealthPool

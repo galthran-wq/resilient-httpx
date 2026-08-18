@@ -11,25 +11,28 @@ import structlog
 from tenacity import RetryError
 
 from resilient_httpx.exceptions import AllProxiesExhausted, MaxRetriesExceeded
-from resilient_httpx.pool import ProxyPool
+from resilient_httpx.pool import HealthPool
 from resilient_httpx.retry import RetryPolicy
 
 _ALL = "_all"
 _DEFAULT = "_default"
 
-# Recent-browser TLS/JA3 fingerprints for curl_cffi. One is chosen at random per
-# request so a single fingerprint can't be pinned+blocked (Cloudflare fingerprints
-# the plain-httpx TLS handshake and 403s it; a real-browser JA3 passes). Valid
-# curl_cffi 0.16.x targets.
+# Recent-browser TLS/JA3 fingerprints for curl_cffi. The client keeps a health
+# pool over these and prefers the ones currently passing (a WAF may reclassify a
+# specific fingerprint into a "spam" pool and 403 it — see impersonate_bad_statuses;
+# such a target is demoted and rotation moves to a clean one, self-healing on TTL).
+# A diverse, modern set (chrome/firefox/safari/android) so a subset getting flagged
+# still leaves clean options. All are valid curl_cffi 0.16.x targets — keep them
+# current as browsers advance (stale fingerprints are the ones that get flagged).
 IMPERSONATE_TARGETS = (
-    "chrome120",
-    "chrome123",
-    "chrome124",
-    "chrome131",
-    "safari17_0",
-    "safari17_2_1",
-    "safari18_0",
-    "edge101",
+    "chrome136",
+    "chrome142",
+    "chrome145",
+    "chrome146",
+    "firefox144",
+    "firefox147",
+    "safari184",
+    "chrome131_android",
 )
 
 
@@ -73,7 +76,13 @@ class _ImpersonateClient:
         extra = kwargs.get("headers")
         if extra:
             headers.update({k: v for k, v in dict(extra).items() if k.lower() != "user-agent"})
-        target = random.choice(self._targets)
+        # The client's target pool selects adaptively and passes the choice in;
+        # fall back to a random pick when called directly (no pool).
+        target = kwargs.get("impersonate_target")
+        if not target:
+            if not self._targets:
+                raise ValueError("impersonate requested but no impersonate_targets configured")
+            target = random.choice(self._targets)
         try:
             async with AsyncSession() as session:
                 resp = await session.request(
@@ -151,10 +160,31 @@ class AsyncProxyHttpClient:
         probe_timeout: float = 5.0,
         impersonate: bool = False,
         impersonate_targets: tuple[str, ...] = IMPERSONATE_TARGETS,
+        impersonate_strategy: str = "greedy",
+        impersonate_bad_statuses: tuple[int, ...] = (403,),
+        impersonate_blacklist_threshold: int = 2,
+        impersonate_blacklist_ttl: float = 600.0,
+        impersonate_greedy_exploration: float = 0.1,
     ) -> None:
         self._strategy = proxy_strategy
         self._impersonate = impersonate
         self._impersonate_targets = impersonate_targets
+        self._impersonate_bad_statuses = frozenset(impersonate_bad_statuses)
+        # Health pool over the fingerprints: a target that returns a bad status
+        # (default 403 — WAF fingerprint block) is demoted; rotation prefers
+        # clean targets and self-heals on TTL. Lower threshold + longer TTL than
+        # proxies: a flagged fingerprint should drop out fast and stay out.
+        self._target_pool: HealthPool | None = (
+            HealthPool(
+                list(impersonate_targets),
+                strategy=impersonate_strategy,
+                blacklist_threshold=impersonate_blacklist_threshold,
+                blacklist_ttl=impersonate_blacklist_ttl,
+                greedy_exploration=impersonate_greedy_exploration,
+            )
+            if impersonate_targets
+            else None
+        )
         self._blacklist_threshold = blacklist_threshold
         self._blacklist_ttl = blacklist_ttl
         self._on_blacklist = on_blacklist
@@ -163,7 +193,7 @@ class AsyncProxyHttpClient:
         self._probe_on_start = probe_on_start
         self._probe_url = probe_url
         self._probe_timeout = probe_timeout
-        self._pools: dict[str, ProxyPool] = {}
+        self._pools: dict[str, HealthPool] = {}
         self._default_pool_name: str | None = None
         self._probed = False
         self._probe_lock = asyncio.Lock()
@@ -200,14 +230,14 @@ class AsyncProxyHttpClient:
         name: str,
         proxies: list[str],
         state: dict[str, object] | None = None,
-    ) -> ProxyPool:
+    ) -> HealthPool:
         on_blacklist = None
         on_unblacklist = None
         if self._on_blacklist is not None:
             on_blacklist = lambda proxy, n=name: self._on_blacklist(n, proxy)
         if self._on_unblacklist is not None:
             on_unblacklist = lambda proxy, n=name: self._on_unblacklist(n, proxy)
-        return ProxyPool(
+        return HealthPool(
             proxies=proxies,
             strategy=self._strategy,
             blacklist_threshold=self._blacklist_threshold,
@@ -237,7 +267,7 @@ class AsyncProxyHttpClient:
         if self._default_pool_name == _ALL or self._default_pool_name is None:
             self._build_combined_pool()
 
-    def _resolve_pool(self, pool: str | None) -> ProxyPool | None:
+    def _resolve_pool(self, pool: str | None) -> HealthPool | None:
         if pool is not None:
             if pool not in self._pools:
                 raise ValueError(f"Unknown pool: {pool!r}")
@@ -272,6 +302,35 @@ class AsyncProxyHttpClient:
             for name, pool in self._pools.items()
             if name != _ALL
         }
+
+    def impersonate_snapshot(self) -> list[dict] | None:
+        """Per-target health (ok/fail counts, blacklist state) for the impersonate
+        target pool, or None when impersonation is not configured."""
+        return self._target_pool.snapshot() if self._target_pool is not None else None
+
+    async def _pick_target(self, imp: bool, pinned: str | None) -> str | None:
+        if not imp:
+            return None
+        if pinned is not None:
+            return pinned
+        if self._target_pool is not None:
+            chosen = await self._target_pool.acquire()
+            if chosen is not None:
+                return chosen
+        # All targets blacklisted (or no pool): fall back to a random pick so a
+        # transient all-flagged window still issues the request (and its outcome
+        # re-scores the pool).
+        return random.choice(self._impersonate_targets) if self._impersonate_targets else None
+
+    async def _report_target(self, target: str | None, status_code: int) -> None:
+        # A caller-pinned target may be outside the configured set (not a pool
+        # member) — use it but don't try to score it.
+        if target is None or self._target_pool is None or target not in self._impersonate_targets:
+            return
+        if status_code in self._impersonate_bad_statuses:
+            await self._target_pool.report_failure(target)
+        else:
+            await self._target_pool.report_success(target)
 
     async def probe_all(self) -> dict[str, list[str]]:
         """Probe each proxy once via probe_url. Returns {pool_name: [dead_proxies]}.
@@ -312,6 +371,7 @@ class AsyncProxyHttpClient:
     ) -> httpx.Response:
         await self._ensure_probed()
         imp = self._impersonate if impersonate is None else impersonate
+        pinned_target = kwargs.pop("impersonate_target", None)
         active_pool = self._resolve_pool(pool)
         pool_name = pool or self._default_pool_name or _DEFAULT
         retrying = self._retry.build_retrying(
@@ -342,9 +402,11 @@ class AsyncProxyHttpClient:
                     )
 
                     client = self._get_client(proxy, imp)
+                    target = await self._pick_target(imp, pinned_target)
+                    call_kwargs = kwargs if target is None else {**kwargs, "impersonate_target": target}
                     started = time.monotonic()
                     try:
-                        response = await client.request(method, url, **kwargs)
+                        response = await client.request(method, url, **call_kwargs)
                     except tuple(self._retry.retry_on_exception):
                         duration = time.monotonic() - started
                         self._emit_outcome(pool_name, proxy, "failed", duration)
@@ -355,6 +417,8 @@ class AsyncProxyHttpClient:
                                     "proxy_blacklisted", proxy=proxy
                                 )
                         raise
+
+                    await self._report_target(target, response.status_code)
 
                     if response.status_code in self._retry.retry_on:
                         duration = time.monotonic() - started
@@ -394,6 +458,7 @@ class AsyncProxyHttpClient:
     ) -> AsyncIterator[httpx.Response]:
         await self._ensure_probed()
         imp = self._impersonate if impersonate is None else impersonate
+        pinned_target = kwargs.pop("impersonate_target", None)
         active_pool = self._resolve_pool(pool)
         pool_name = pool or self._default_pool_name or _DEFAULT
         retrying = self._retry.build_retrying(
@@ -428,8 +493,10 @@ class AsyncProxyHttpClient:
                         )
 
                         client = self._get_client(proxy, imp)
+                        target = await self._pick_target(imp, pinned_target)
+                        call_kwargs = kwargs if target is None else {**kwargs, "impersonate_target": target}
                         started = time.monotonic()
-                        cm = client.stream(method, url, **kwargs)
+                        cm = client.stream(method, url, **call_kwargs)
                         try:
                             response = await cm.__aenter__()
                         except tuple(self._retry.retry_on_exception):
@@ -442,6 +509,8 @@ class AsyncProxyHttpClient:
                                         "proxy_blacklisted", proxy=proxy
                                     )
                             raise
+
+                        await self._report_target(target, response.status_code)
 
                         if response.status_code in self._retry.retry_on:
                             await cm.__aexit__(None, None, None)
